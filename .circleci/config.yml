@@ -62,7 +62,7 @@ jobs:
           (
           cd ${GOPATH_BASE}/${CIRCLE_PROJECT_REPONAME} && \
           govend -u && \
-          git diff -quiet
+          git diff --quiet
           )
 
    - deploy:
