@@ -1,13 +1,10 @@
 package mssql
 
-import (
-	"context"
-	"testing"
-)
+import "testing"
 
 func TestBadOpen(t *testing.T) {
 	drv := driverWithProcess(t)
-	_, err := drv.open(context.Background(), "port=bad")
+	_, err := drv.open("port=bad")
 	if err == nil {
 		t.Fail()
 	}
@@ -20,14 +17,8 @@ func TestIsProc(t *testing.T) {
 	}{
 		{"proc", true},
 		{"select 1;", false},
-		{"select 1", false},
 		{"[proc 1]", true},
 		{"[proc\n1]", false},
-		{"schema.name", true},
-		{"[schema].[name]", true},
-		{"schema.[name]", true},
-		{"[schema].name", true},
-		{"schema.[proc name]", true},
 	}
 
 	for _, item := range list {

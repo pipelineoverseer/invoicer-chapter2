@@ -4,7 +4,7 @@ import (
 	"bytes"
 	"database/sql"
 	"fmt"
-	"regexp"
+	"strings"
 	"testing"
 	"time"
 
@@ -267,7 +267,9 @@ func TestTimestampWithOutTimezone(t *testing.T) {
 			t.Fatalf("Could not run query: %v", err)
 		}
 
-		if !r.Next() {
+		n := r.Next()
+
+		if n != true {
 			t.Fatal("Expected at least one row")
 		}
 
@@ -287,7 +289,8 @@ func TestTimestampWithOutTimezone(t *testing.T) {
 				expected, result)
 		}
 
-		if r.Next() {
+		n = r.Next()
+		if n != false {
 			t.Fatal("Expected only one row")
 		}
 	}
@@ -304,27 +307,24 @@ func TestInfinityTimestamp(t *testing.T) {
 	var err error
 	var resultT time.Time
 
-	expectedErrorStrRegexp := regexp.MustCompile(
-		`^sql: Scan error on column index 0(, name "timestamp(tz)?"|): unsupported`)
-
+	expectedErrorStrPrefix := `sql: Scan error on column index 0: unsupported`
 	type testCases []struct {
-		Query                  string
-		Param                  string
-		ExpectedErrorStrRegexp *regexp.Regexp
-		ExpectedVal            interface{}
+		Query                string
+		Param                string
+		ExpectedErrStrPrefix string
+		ExpectedVal          interface{}
 	}
 	tc := testCases{
-		{"SELECT $1::timestamp", "-infinity", expectedErrorStrRegexp, "-infinity"},
-		{"SELECT $1::timestamptz", "-infinity", expectedErrorStrRegexp, "-infinity"},
-		{"SELECT $1::timestamp", "infinity", expectedErrorStrRegexp, "infinity"},
-		{"SELECT $1::timestamptz", "infinity", expectedErrorStrRegexp, "infinity"},
+		{"SELECT $1::timestamp", "-infinity", expectedErrorStrPrefix, "-infinity"},
+		{"SELECT $1::timestamptz", "-infinity", expectedErrorStrPrefix, "-infinity"},
+		{"SELECT $1::timestamp", "infinity", expectedErrorStrPrefix, "infinity"},
+		{"SELECT $1::timestamptz", "infinity", expectedErrorStrPrefix, "infinity"},
 	}
 	// try to assert []byte to time.Time
 	for _, q := range tc {
 		err = db.QueryRow(q.Query, q.Param).Scan(&resultT)
-		if err == nil || !q.ExpectedErrorStrRegexp.MatchString(err.Error()) {
-			t.Errorf("Scanning -/+infinity, expected error to match regexp %q, got %q",
-				q.ExpectedErrorStrRegexp, err)
+		if !strings.HasPrefix(err.Error(), q.ExpectedErrStrPrefix) {
+			t.Errorf("Scanning -/+infinity, expected error to have prefix %q, got %q", q.ExpectedErrStrPrefix, err)
 		}
 	}
 	// yield []byte
@@ -731,7 +731,8 @@ func TestAppendEscapedText(t *testing.T) {
 }
 
 func TestAppendEscapedTextExistingBuffer(t *testing.T) {
-	buf := []byte("123\t")
+	var buf []byte
+	buf = []byte("123\t")
 	if esc := appendEscapedText(buf, "hallo\tescape"); string(esc) != "123\thallo\\tescape" {
 		t.Fatal(string(esc))
 	}

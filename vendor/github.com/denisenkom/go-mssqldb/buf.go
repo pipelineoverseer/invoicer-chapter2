@@ -24,20 +24,16 @@ type header struct {
 type tdsBuffer struct {
 	transport io.ReadWriteCloser
 
-	packetSize int
-
 	// Write fields.
-	wbuf        []byte
-	wpos        int
-	wPacketSeq  byte
-	wPacketType packetType
+	wbuf []byte
+	wpos uint16
 
 	// Read fields.
 	rbuf        []byte
-	rpos        int
-	rsize       int
+	rpos        uint16
+	rsize       uint16
 	final       bool
-	rPacketType packetType
+	packet_type packetType
 
 	// afterFirst is assigned to right after tdsBuffer is created and
 	// before the first use. It is executed after the first packet is
@@ -46,36 +42,40 @@ type tdsBuffer struct {
 }
 
 func newTdsBuffer(bufsize uint16, transport io.ReadWriteCloser) *tdsBuffer {
-	return &tdsBuffer{
-		packetSize: int(bufsize),
-		wbuf:       make([]byte, 1<<16),
-		rbuf:       make([]byte, 1<<16),
-		rpos:       8,
-		transport:  transport,
+	w := new(tdsBuffer)
+	w.wbuf = make([]byte, bufsize)
+	w.rbuf = make([]byte, bufsize)
+	w.wpos = 0
+	w.rpos = 8
+	w.transport = transport
+	return w
+}
+
+func (rw *tdsBuffer) ResizeBuffer(packetsizei int) {
+	if len(rw.rbuf) != packetsizei {
+		newbuf := make([]byte, packetsizei)
+		copy(newbuf, rw.rbuf)
+		rw.rbuf = newbuf
+	}
+	if len(rw.wbuf) != packetsizei {
+		newbuf := make([]byte, packetsizei)
+		copy(newbuf, rw.wbuf)
+		rw.wbuf = newbuf
 	}
 }
 
-func (rw *tdsBuffer) ResizeBuffer(packetSize int) {
-	rw.packetSize = packetSize
-}
-
-func (w *tdsBuffer) PackageSize() int {
-	return w.packetSize
+func (w *tdsBuffer) PackageSize() uint32 {
+	return uint32(len(w.wbuf))
 }
 
 func (w *tdsBuffer) flush() (err error) {
 	// Write packet size.
-	w.wbuf[0] = byte(w.wPacketType)
-	binary.BigEndian.PutUint16(w.wbuf[2:], uint16(w.wpos))
-	w.wbuf[6] = w.wPacketSeq
+	binary.BigEndian.PutUint16(w.wbuf[2:], w.wpos)
 
 	// Write packet into underlying transport.
 	if _, err = w.transport.Write(w.wbuf[:w.wpos]); err != nil {
 		return err
 	}
-	// It is possible to create a whole new buffer after a flush.
-	// Useful for debugging. Normally reuse the buffer.
-	// w.wbuf = make([]byte, 1<<16)
 
 	// Execute afterFirst hook if it is set.
 	if w.afterFirst != nil {
@@ -84,27 +84,30 @@ func (w *tdsBuffer) flush() (err error) {
 	}
 
 	w.wpos = 8
-	w.wPacketSeq++
+	// packet number
+	w.wbuf[6] += 1
 	return nil
 }
 
 func (w *tdsBuffer) Write(p []byte) (total int, err error) {
+	total = 0
 	for {
-		copied := copy(w.wbuf[w.wpos:w.packetSize], p)
-		w.wpos += copied
+		copied := copy(w.wbuf[w.wpos:], p)
+		w.wpos += uint16(copied)
 		total += copied
 		if copied == len(p) {
-			return
+			break
 		}
 		if err = w.flush(); err != nil {
 			return
 		}
 		p = p[copied:]
 	}
+	return
 }
 
 func (w *tdsBuffer) WriteByte(b byte) error {
-	if int(w.wpos) == len(w.wbuf) || w.wpos == w.packetSize {
+	if int(w.wpos) == len(w.wbuf) {
 		if err := w.flush(); err != nil {
 			return err
 		}
@@ -114,49 +117,43 @@ func (w *tdsBuffer) WriteByte(b byte) error {
 	return nil
 }
 
-func (w *tdsBuffer) BeginPacket(packetType packetType, resetSession bool) {
-	status := byte(0)
-	if resetSession {
-		switch packetType {
-		// Reset session can only be set on the following packet types.
-		case packSQLBatch, packRPCRequest, packTransMgrReq:
-			status = 0x8
-		}
-	}
-	w.wbuf[1] = status // Packet is incomplete. This byte is set again in FinishPacket.
+func (w *tdsBuffer) BeginPacket(packet_type packetType) {
+	w.wbuf[0] = byte(packet_type)
+	w.wbuf[1] = 0 // packet is incomplete
+	w.wbuf[4] = 0 // spid
+	w.wbuf[5] = 0
+	w.wbuf[6] = 1 // packet id
+	w.wbuf[7] = 0 // window
 	w.wpos = 8
-	w.wPacketSeq = 1
-	w.wPacketType = packetType
 }
 
 func (w *tdsBuffer) FinishPacket() error {
-	w.wbuf[1] |= 1 // Mark this as the last packet in the message.
+	w.wbuf[1] = 1 // this is last packet
 	return w.flush()
 }
 
-var headerSize = binary.Size(header{})
-
 func (r *tdsBuffer) readNextPacket() error {
-	h := header{}
+	header := header{}
 	var err error
-	err = binary.Read(r.transport, binary.BigEndian, &h)
+	err = binary.Read(r.transport, binary.BigEndian, &header)
 	if err != nil {
 		return err
 	}
-	if int(h.Size) > r.packetSize {
+	offset := uint16(binary.Size(header))
+	if int(header.Size) > len(r.rbuf) {
 		return errors.New("Invalid packet size, it is longer than buffer size")
 	}
-	if headerSize > int(h.Size) {
+	if int(offset) > int(header.Size) {
 		return errors.New("Invalid packet size, it is shorter than header size")
 	}
-	_, err = io.ReadFull(r.transport, r.rbuf[headerSize:h.Size])
+	_, err = io.ReadFull(r.transport, r.rbuf[offset:header.Size])
 	if err != nil {
 		return err
 	}
-	r.rpos = headerSize
-	r.rsize = int(h.Size)
-	r.final = h.Status != 0
-	r.rPacketType = h.PacketType
+	r.rpos = offset
+	r.rsize = header.Size
+	r.final = header.Status != 0
+	r.packet_type = header.PacketType
 	return nil
 }
 
@@ -165,7 +162,7 @@ func (r *tdsBuffer) BeginRead() (packetType, error) {
 	if err != nil {
 		return 0, err
 	}
-	return r.rPacketType, nil
+	return r.packet_type, nil
 }
 
 func (r *tdsBuffer) ReadByte() (res byte, err error) {
@@ -221,27 +218,23 @@ func (r *tdsBuffer) uint16() uint16 {
 }
 
 func (r *tdsBuffer) BVarChar() string {
-	return readBVarCharOrPanic(r)
-}
-
-func readBVarCharOrPanic(r io.Reader) string {
-	s, err := readBVarChar(r)
-	if err != nil {
-		badStreamPanic(err)
-	}
-	return s
-}
-
-func readUsVarCharOrPanic(r io.Reader) string {
-	s, err := readUsVarChar(r)
-	if err != nil {
-		badStreamPanic(err)
-	}
-	return s
+	l := int(r.byte())
+	return r.readUcs2(l)
 }
 
 func (r *tdsBuffer) UsVarChar() string {
-	return readUsVarCharOrPanic(r)
+	l := int(r.uint16())
+	return r.readUcs2(l)
+}
+
+func (r *tdsBuffer) readUcs2(numchars int) string {
+	b := make([]byte, numchars*2)
+	r.ReadFull(b)
+	res, err := ucs22str(b)
+	if err != nil {
+		badStreamPanic(err)
+	}
+	return res
 }
 
 func (r *tdsBuffer) Read(buf []byte) (copied int, err error) {
@@ -257,6 +250,6 @@ func (r *tdsBuffer) Read(buf []byte) (copied int, err error) {
 		}
 	}
 	copied = copy(buf, r.rbuf[r.rpos:r.rsize])
-	r.rpos += copied
+	r.rpos += uint16(copied)
 	return
 }

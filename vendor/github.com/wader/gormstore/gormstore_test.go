@@ -38,10 +38,9 @@ func connectDbURI(uri string) (*gorm.DB, error) {
 	var err error
 	// retry to give some time for db to be ready
 	for i := 0; i < 50; i++ {
-		var db *gorm.DB
-		db, err = gorm.Open(driver, dsn)
+		g, err := gorm.Open(driver, dsn)
 		if err == nil {
-			return db, nil
+			return g, nil
 		}
 		time.Sleep(500 * time.Millisecond)
 	}
@@ -57,7 +56,7 @@ func newDB() *gorm.DB {
 		panic(err)
 	}
 
-	// db.LogMode(true)
+	//db.LogMode(true)
 
 	// cleanup db
 	if err := db.DropTableIfExists(

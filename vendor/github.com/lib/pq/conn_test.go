@@ -1,7 +1,6 @@
 package pq
 
 import (
-	"context"
 	"database/sql"
 	"database/sql/driver"
 	"fmt"
@@ -29,7 +28,7 @@ func forceBinaryParameters() bool {
 	}
 }
 
-func testConninfo(conninfo string) string {
+func openTestConnConninfo(conninfo string) (*sql.DB, error) {
 	defaultTo := func(envvar string, value string) {
 		if os.Getenv(envvar) == "" {
 			os.Setenv(envvar, value)
@@ -42,13 +41,10 @@ func testConninfo(conninfo string) string {
 	if forceBinaryParameters() &&
 		!strings.HasPrefix(conninfo, "postgres://") &&
 		!strings.HasPrefix(conninfo, "postgresql://") {
-		conninfo += " binary_parameters=yes"
+		conninfo = conninfo + " binary_parameters=yes"
 	}
-	return conninfo
-}
 
-func openTestConnConninfo(conninfo string) (*sql.DB, error) {
-	return sql.Open("postgres", testConninfo(conninfo))
+	return sql.Open("postgres", conninfo)
 }
 
 func openTestConn(t Fatalistic) *sql.DB {
@@ -641,57 +637,6 @@ func TestErrorDuringStartup(t *testing.T) {
 	}
 }
 
-type testConn struct {
-	closed bool
-	net.Conn
-}
-
-func (c *testConn) Close() error {
-	c.closed = true
-	return c.Conn.Close()
-}
-
-type testDialer struct {
-	conns []*testConn
-}
-
-func (d *testDialer) Dial(ntw, addr string) (net.Conn, error) {
-	c, err := net.Dial(ntw, addr)
-	if err != nil {
-		return nil, err
-	}
-	tc := &testConn{Conn: c}
-	d.conns = append(d.conns, tc)
-	return tc, nil
-}
-
-func (d *testDialer) DialTimeout(ntw, addr string, timeout time.Duration) (net.Conn, error) {
-	c, err := net.DialTimeout(ntw, addr, timeout)
-	if err != nil {
-		return nil, err
-	}
-	tc := &testConn{Conn: c}
-	d.conns = append(d.conns, tc)
-	return tc, nil
-}
-
-func TestErrorDuringStartupClosesConn(t *testing.T) {
-	// Don't use the normal connection setup, this is intended to
-	// blow up in the startup packet from a non-existent user.
-	var d testDialer
-	c, err := DialOpen(&d, testConninfo("user=thisuserreallydoesntexist"))
-	if err == nil {
-		c.Close()
-		t.Fatal("expected dial error")
-	}
-	if len(d.conns) != 1 {
-		t.Fatalf("got len(d.conns) = %d, want = %d", len(d.conns), 1)
-	}
-	if !d.conns[0].closed {
-		t.Error("connection leaked")
-	}
-}
-
 func TestBadConn(t *testing.T) {
 	var err error
 
@@ -724,15 +669,7 @@ func TestBadConn(t *testing.T) {
 // TestCloseBadConn tests that the underlying connection can be closed with
 // Close after an error.
 func TestCloseBadConn(t *testing.T) {
-	host := os.Getenv("PGHOST")
-	if host == "" {
-		host = "localhost"
-	}
-	port := os.Getenv("PGPORT")
-	if port == "" {
-		port = "5432"
-	}
-	nc, err := net.Dial("tcp", host+":"+port)
+	nc, err := net.Dial("tcp", "localhost:5432")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -998,14 +935,12 @@ func TestParseErrorInExtendedQuery(t *testing.T) {
 	db := openTestConn(t)
 	defer db.Close()
 
-	_, err := db.Query("PARSE_ERROR $1", 1)
-	pqErr, _ := err.(*Error)
-	// Expecting a syntax error.
-	if err == nil || pqErr == nil || pqErr.Code != "42601" {
-		t.Fatalf("expected syntax error, got %s", err)
+	rows, err := db.Query("PARSE_ERROR $1", 1)
+	if err == nil {
+		t.Fatal("expected error")
 	}
 
-	rows, err := db.Query("SELECT 1")
+	rows, err = db.Query("SELECT 1")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1135,11 +1070,10 @@ func TestReadFloatPrecision(t *testing.T) {
 	db := openTestConn(t)
 	defer db.Close()
 
-	row := db.QueryRow("SELECT float4 '0.10000122', float8 '35.03554004971999', float4 '1.2'")
+	row := db.QueryRow("SELECT float4 '0.10000122', float8 '35.03554004971999'")
 	var float4val float32
 	var float8val float64
-	var float4val2 float64
-	err := row.Scan(&float4val, &float8val, &float4val2)
+	err := row.Scan(&float4val, &float8val)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1148,9 +1082,6 @@ func TestReadFloatPrecision(t *testing.T) {
 	}
 	if float8val != float64(35.03554004971999) {
 		t.Errorf("Expected float8 fidelity to be maintained; got no match")
-	}
-	if float4val2 != float64(1.2) {
-		t.Errorf("Expected float4 fidelity into a float64 to be maintained; got no match")
 	}
 }
 
@@ -1274,11 +1205,16 @@ func TestParseComplete(t *testing.T) {
 	tpc("SELECT foo", "", 0, true) // invalid row count
 }
 
-// Test interface conformance.
-var (
-	_ driver.ExecerContext  = (*conn)(nil)
-	_ driver.QueryerContext = (*conn)(nil)
-)
+func TestExecerInterface(t *testing.T) {
+	// Gin up a straw man private struct just for the type check
+	cn := &conn{c: nil}
+	var cni interface{} = cn
+
+	_, ok := cni.(driver.Execer)
+	if !ok {
+		t.Fatal("Driver doesn't implement Execer")
+	}
+}
 
 func TestNullAfterNonNull(t *testing.T) {
 	db := openTestConn(t)
@@ -1456,29 +1392,36 @@ func TestParseOpts(t *testing.T) {
 }
 
 func TestRuntimeParameters(t *testing.T) {
+	type RuntimeTestResult int
+	const (
+		ResultUnknown RuntimeTestResult = iota
+		ResultSuccess
+		ResultError // other error
+	)
+
 	tests := []struct {
-		conninfo string
-		param    string
-		expected string
-		success  bool
+		conninfo        string
+		param           string
+		expected        string
+		expectedOutcome RuntimeTestResult
 	}{
 		// invalid parameter
-		{"DOESNOTEXIST=foo", "", "", false},
+		{"DOESNOTEXIST=foo", "", "", ResultError},
 		// we can only work with a specific value for these two
-		{"client_encoding=SQL_ASCII", "", "", false},
-		{"datestyle='ISO, YDM'", "", "", false},
+		{"client_encoding=SQL_ASCII", "", "", ResultError},
+		{"datestyle='ISO, YDM'", "", "", ResultError},
 		// "options" should work exactly as it does in libpq
-		{"options='-c search_path=pqgotest'", "search_path", "pqgotest", true},
+		{"options='-c search_path=pqgotest'", "search_path", "pqgotest", ResultSuccess},
 		// pq should override client_encoding in this case
-		{"options='-c client_encoding=SQL_ASCII'", "client_encoding", "UTF8", true},
+		{"options='-c client_encoding=SQL_ASCII'", "client_encoding", "UTF8", ResultSuccess},
 		// allow client_encoding to be set explicitly
-		{"client_encoding=UTF8", "client_encoding", "UTF8", true},
+		{"client_encoding=UTF8", "client_encoding", "UTF8", ResultSuccess},
 		// test a runtime parameter not supported by libpq
-		{"work_mem='139kB'", "work_mem", "139kB", true},
+		{"work_mem='139kB'", "work_mem", "139kB", ResultSuccess},
 		// test fallback_application_name
-		{"application_name=foo fallback_application_name=bar", "application_name", "foo", true},
-		{"application_name='' fallback_application_name=bar", "application_name", "", true},
-		{"fallback_application_name=bar", "application_name", "bar", true},
+		{"application_name=foo fallback_application_name=bar", "application_name", "foo", ResultSuccess},
+		{"application_name='' fallback_application_name=bar", "application_name", "", ResultSuccess},
+		{"fallback_application_name=bar", "application_name", "bar", ResultSuccess},
 	}
 
 	for _, test := range tests {
@@ -1493,23 +1436,23 @@ func TestRuntimeParameters(t *testing.T) {
 			continue
 		}
 
-		tryGetParameterValue := func() (value string, success bool) {
+		tryGetParameterValue := func() (value string, outcome RuntimeTestResult) {
 			defer db.Close()
 			row := db.QueryRow("SELECT current_setting($1)", test.param)
 			err = row.Scan(&value)
 			if err != nil {
-				return "", false
+				return "", ResultError
 			}
-			return value, true
+			return value, ResultSuccess
 		}
 
-		value, success := tryGetParameterValue()
-		if success != test.success && !test.success {
+		value, outcome := tryGetParameterValue()
+		if outcome != test.expectedOutcome && outcome == ResultError {
 			t.Fatalf("%v: unexpected error: %v", test.conninfo, err)
 		}
-		if success != test.success {
+		if outcome != test.expectedOutcome {
 			t.Fatalf("unexpected outcome %v (was expecting %v) for conninfo \"%s\"",
-				success, test.success, test.conninfo)
+				outcome, test.expectedOutcome, test.conninfo)
 		}
 		if value != test.expected {
 			t.Fatalf("bad value for %s: got %s, want %s with conninfo \"%s\"",
@@ -1558,38 +1501,6 @@ func TestQuoteIdentifier(t *testing.T) {
 		got := QuoteIdentifier(test.input)
 		if got != test.want {
 			t.Errorf("QuoteIdentifier(%q) = %v want %v", test.input, got, test.want)
-		}
-	}
-}
-
-func TestQuoteLiteral(t *testing.T) {
-	var cases = []struct {
-		input string
-		want  string
-	}{
-		{`foo`, `'foo'`},
-		{`foo bar baz`, `'foo bar baz'`},
-		{`foo'bar`, `'foo''bar'`},
-		{`foo\bar`, ` E'foo\\bar'`},
-		{`foo\ba'r`, ` E'foo\\ba''r'`},
-		{`foo"bar`, `'foo"bar'`},
-		{`foo\x00bar`, ` E'foo\\x00bar'`},
-		{`\x00foo`, ` E'\\x00foo'`},
-		{`'`, `''''`},
-		{`''`, `''''''`},
-		{`\`, ` E'\\'`},
-		{`'abc'; DROP TABLE users;`, `'''abc''; DROP TABLE users;'`},
-		{`\'`, ` E'\\'''`},
-		{`E'\''`, ` E'E''\\'''''`},
-		{`e'\''`, ` E'e''\\'''''`},
-		{`E'\'abc\'; DROP TABLE users;'`, ` E'E''\\''abc\\''; DROP TABLE users;'''`},
-		{`e'\'abc\'; DROP TABLE users;'`, ` E'e''\\''abc\\''; DROP TABLE users;'''`},
-	}
-
-	for _, test := range cases {
-		got := QuoteLiteral(test.input)
-		if got != test.want {
-			t.Errorf("QuoteLiteral(%q) = %v want %v", test.input, got, test.want)
 		}
 	}
 }
@@ -1654,10 +1565,10 @@ func TestRowsResultTag(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer conn.Close()
-	q := conn.(driver.QueryerContext)
+	q := conn.(driver.Queryer)
 
 	for _, test := range tests {
-		if rows, err := q.QueryContext(context.Background(), test.query, nil); err != nil {
+		if rows, err := q.Query(test.query, nil); err != nil {
 			t.Fatalf("%s: %s", test.query, err)
 		} else {
 			r := rows.(ResultTag)
@@ -1700,78 +1611,4 @@ func TestQuickClose(t *testing.T) {
 	if err := tx.Commit(); err != nil {
 		t.Fatal(err)
 	}
-}
-
-func TestMultipleResult(t *testing.T) {
-	db := openTestConn(t)
-	defer db.Close()
-
-	rows, err := db.Query(`
-		begin;
-			select * from information_schema.tables limit 1;
-			select * from information_schema.columns limit 2;
-		commit;
-	`)
-	if err != nil {
-		t.Fatal(err)
-	}
-	type set struct {
-		cols     []string
-		rowCount int
-	}
-	buf := []*set{}
-	for {
-		cols, err := rows.Columns()
-		if err != nil {
-			t.Fatal(err)
-		}
-		s := &set{
-			cols: cols,
-		}
-		buf = append(buf, s)
-
-		for rows.Next() {
-			s.rowCount++
-		}
-		if !rows.NextResultSet() {
-			break
-		}
-	}
-	if len(buf) != 2 {
-		t.Fatalf("got %d sets, expected 2", len(buf))
-	}
-	if len(buf[0].cols) == len(buf[1].cols) || len(buf[1].cols) == 0 {
-		t.Fatal("invalid cols size, expected different column count and greater then zero")
-	}
-	if buf[0].rowCount != 1 || buf[1].rowCount != 2 {
-		t.Fatal("incorrect number of rows returned")
-	}
-}
-
-func TestCopyInStmtAffectedRows(t *testing.T) {
-	db := openTestConn(t)
-	defer db.Close()
-
-	_, err := db.Exec("CREATE TEMP TABLE temp (a int)")
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	txn, err := db.BeginTx(context.TODO(), nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	copyStmt, err := txn.Prepare(CopyIn("temp", "a"))
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	res, err := copyStmt.Exec()
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	res.RowsAffected()
-	res.LastInsertId()
 }
